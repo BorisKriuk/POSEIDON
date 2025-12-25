@@ -1,0 +1,10 @@
+{
+  "total_samples": 171577,
+  "train_samples": 137261,
+  "val_samples": 34316,
+  "models_evaluated": 9,
+  "best_model": "Random Forest",
+  "best_f1": 0.5639294999174835,
+  "piebm_improvement": -23.35469204010074,
+  "device": "mps"
+}
