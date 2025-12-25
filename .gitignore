@@ -52,3 +52,5 @@ outputs/
 # Virtual environment
 venv/
 __pycache__/
+venv/
+earthquake_dataset/
