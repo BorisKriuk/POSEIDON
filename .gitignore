@@ -1,0 +1,54 @@
+# Large data files
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.csv
+*.parquet
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.weights
+
+# Data directories
+data/
+datasets/
+checkpoints/
+outputs/
+*.mseed
+*.sac
+
+# Virtual environment
+venv/
+__pycache__/
+# Large data files
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.csv
+*.parquet
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.weights
+
+# Data directories
+data/
+datasets/
+checkpoints/
+outputs/
+*.mseed
+*.sac
+
+# Virtual environment
+venv/
+__pycache__/
