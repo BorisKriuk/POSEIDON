@@ -2,21 +2,14 @@
 """
 PI-EBM: Physics-Informed Energy-Based Model for Earthquake Prediction
 ======================================================================
+Version 2.0 - Optimized for F1 > 0.55
 
-A novel architecture combining:
-1. Convolutional Neural Networks for spatiotemporal pattern recognition
-2. Energy-Based Models for anomaly detection and uncertainty quantification
-3. Physics-informed constraints (Gutenberg-Richter, Omori's Law)
-
-Key improvements in this version:
-- Physics losses are actually computed and used during training
-- Energy function is integrated into predictions via energy-guided attention
-- Focal loss for imbalanced classes (tsunami)
-- Efficient spatial attention for global pattern recognition
-- Proper temporal context via multi-scale grids
-
-Authors: [Your Name]
-Date: 2024
+Key changes from v1:
+- Local context features (seismicity history around event)
+- Two-stage training (predictions first, then physics)
+- Weighted sampling for class imbalance
+- Simplified energy integration
+- Label smoothing for calibration
 """
 
 import numpy as np
@@ -56,29 +49,32 @@ class ModelConfig:
     hidden_dim: int = 192
     latent_dim: int = 64
     num_attention_heads: int = 4
-    dropout: float = 0.3
+    dropout: float = 0.25  # Reduced from 0.3
     
     # Energy-based model settings
     ebm_hidden_dim: int = 128
-    energy_reg_weight: float = 0.01
-    contrastive_margin: float = 1.0
+    energy_reg_weight: float = 0.005  # Reduced
+    contrastive_margin: float = 0.5  # Reduced
     
-    # Physics constraints
-    lambda_physics: float = 0.5
-    lambda_contrastive: float = 0.2
+    # Physics constraints - REDUCED for stage 1
+    lambda_physics: float = 0.1  # Was 0.5
+    lambda_contrastive: float = 0.1  # Was 0.2
     
     # Training
     batch_size: int = 64
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
-    epochs: int = 60
-    patience: int = 8
+    epochs: int = 80  # More epochs
+    patience: int = 12  # More patience
     warmup_epochs: int = 5
+    
+    # Label smoothing
+    label_smoothing: float = 0.05
     
     # Focal loss for imbalanced classes
     focal_gamma: float = 2.0
     
-    # Class weights (computed from data, these are defaults)
+    # Class weights
     tsunami_pos_weight: float = 50.0
     
     device: str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
@@ -86,6 +82,9 @@ class ModelConfig:
     # Data settings
     min_magnitude_trigger: float = 5.0
     aftershock_magnitude_threshold: float = 3.0
+    
+    # NEW: Feature settings
+    event_feature_dim: int = 16  # Increased from 12
 
 
 # =============================================================================
@@ -102,15 +101,22 @@ class FocalLoss(nn.Module):
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred = pred.clamp(1e-7, 1 - 1e-7)
-        
-        # Binary cross entropy
         bce = -target * torch.log(pred) * self.pos_weight - (1 - target) * torch.log(1 - pred)
-        
-        # Focal weight
         pt = torch.where(target == 1, pred, 1 - pred)
         focal_weight = (1 - pt) ** self.gamma
-        
         return (focal_weight * bce).mean()
+
+
+class LabelSmoothingBCE(nn.Module):
+    """Binary cross entropy with label smoothing"""
+    
+    def __init__(self, smoothing: float = 0.05):
+        super().__init__()
+        self.smoothing = smoothing
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target_smooth = target * (1 - self.smoothing) + 0.5 * self.smoothing
+        return F.binary_cross_entropy(pred.clamp(1e-7, 1-1e-7), target_smooth)
 
 
 # =============================================================================
@@ -118,22 +124,17 @@ class FocalLoss(nn.Module):
 # =============================================================================
 
 class EarthquakeDataProcessor:
-    """
-    Processes raw earthquake catalogs into model-ready tensors.
-    
-    Creates multi-channel spatiotemporal grids where each channel
-    represents a different seismic property.
-    """
+    """Processes raw earthquake catalogs into model-ready tensors."""
     
     def __init__(self, config: ModelConfig):
         self.config = config
         self.lat_edges = np.linspace(-90, 90, config.lat_bins + 1)
         self.lon_edges = np.linspace(-180, 180, config.lon_bins + 1)
         self.stats = {}
+        self._df_cache = None  # Cache for feature extraction
     
     def load_data(self, csv_path: str) -> pd.DataFrame:
         """Load and preprocess earthquake CSV"""
-        
         print(f"Loading {csv_path}...")
         df = pd.read_csv(csv_path)
         
@@ -174,6 +175,8 @@ class EarthquakeDataProcessor:
             'depth_std': df['depth'].std(),
         }
         
+        self._df_cache = df
+        
         print(f"Loaded {len(df):,} earthquakes ({df['year'].min()}-{df['year'].max()})")
         print(f"Magnitude range: {df['magnitude'].min():.1f} - {df['magnitude'].max():.1f}")
         
@@ -185,17 +188,7 @@ class EarthquakeDataProcessor:
         end_date: pd.Timestamp,
         lookback_days: int = None
     ) -> np.ndarray:
-        """
-        Create a multi-channel spatial grid summarizing seismic activity.
-        
-        Channels:
-            0: Log event count
-            1: Maximum magnitude (normalized)
-            2: Cumulative seismic energy (log scale)
-            3: Mean depth (normalized)
-            4: Activity trend (recent vs older)
-            5: Magnitude variance (seismic heterogeneity)
-        """
+        """Create a multi-channel spatial grid summarizing seismic activity."""
         if lookback_days is None:
             lookback_days = self.config.sequence_length
         
@@ -217,7 +210,6 @@ class EarthquakeDataProcessor:
         magnitudes = window_df['magnitude'].values
         depths = window_df['depth'].values
         
-        # For variance computation
         mag_sum = np.zeros((self.config.lat_bins, self.config.lon_bins), dtype=np.float32)
         mag_sq_sum = np.zeros((self.config.lat_bins, self.config.lon_bins), dtype=np.float32)
         
@@ -231,24 +223,19 @@ class EarthquakeDataProcessor:
             mag_sq_sum[li, lo] += magnitudes[i] ** 2
         
         nonzero_mask = grid[0] > 0
-        
-        # Average depth
         grid[3, nonzero_mask] /= grid[0, nonzero_mask]
         
-        # Magnitude variance (b-value proxy)
         mean_mag = np.zeros_like(mag_sum)
         mean_mag[nonzero_mask] = mag_sum[nonzero_mask] / grid[0, nonzero_mask]
         variance = np.zeros_like(mag_sum)
         variance[nonzero_mask] = (mag_sq_sum[nonzero_mask] / grid[0, nonzero_mask]) - mean_mag[nonzero_mask] ** 2
-        grid[5] = np.sqrt(np.maximum(variance, 0)) / 3.0  # Normalize
+        grid[5] = np.sqrt(np.maximum(variance, 0)) / 3.0
         
-        # Normalize channels
         grid[0] = np.log1p(grid[0])
         grid[1] = grid[1] / 10.0
         grid[2] = np.log10(grid[2] + 1) / 20.0
         grid[3] = grid[3] / 700.0
         
-        # Trend channel
         mid_date = end_date - pd.Timedelta(days=lookback_days // 2)
         recent_mask = (df['datetime'] >= mid_date) & (df['datetime'] < end_date)
         older_mask = (df['datetime'] >= start_date) & (df['datetime'] < mid_date)
@@ -264,48 +251,105 @@ class EarthquakeDataProcessor:
         
         return grid
     
-    def create_multiscale_grids(
-        self,
-        df: pd.DataFrame,
-        end_date: pd.Timestamp
-    ) -> np.ndarray:
-        """
-        Create grids at multiple temporal scales.
-        
-        Returns:
-            Array of shape (n_scales * 6, lat_bins, lon_bins)
-        """
+    def create_multiscale_grids(self, df: pd.DataFrame, end_date: pd.Timestamp) -> np.ndarray:
+        """Create grids at multiple temporal scales."""
         grids = []
         for scale in self.config.temporal_scales:
             grid = self.create_spatiotemporal_grid(df, end_date, lookback_days=scale)
             grids.append(grid)
-        
         return np.concatenate(grids, axis=0)
     
-    def extract_event_features(self, row: pd.Series) -> np.ndarray:
-        """Extract normalized features for a single earthquake event."""
+    def extract_event_features(self, row: pd.Series, df: pd.DataFrame = None) -> np.ndarray:
+        """
+        Extract normalized features with LOCAL CONTEXT.
+        This is the key improvement - we add seismicity history around the event.
+        """
+        if df is None:
+            df = self._df_cache
+        
         depth = row.get('depth', 10.0)
         if pd.isna(depth):
             depth = 10.0
         
-        # Tectonic region encoding (simple version based on depth)
+        mag = row['magnitude']
+        lat = row['latitude']
+        lon = row['longitude']
+        event_time = row['datetime']
+        
+        # === LOCAL SEISMICITY FEATURES (KEY IMPROVEMENT) ===
+        local_count_7d = 0
+        local_count_30d = 0
+        local_max_mag = 0
+        local_energy = 0
+        mag_deficit = 0
+        recent_trend = 0
+        
+        if df is not None:
+            # 7-day local window
+            start_7d = event_time - pd.Timedelta(days=7)
+            start_30d = event_time - pd.Timedelta(days=30)
+            
+            # Adaptive radius based on latitude
+            lat_range = 2.0
+            lon_range = 2.0 / max(np.cos(np.radians(lat)), 0.1)
+            
+            local_mask_30d = (
+                (df['datetime'] >= start_30d) &
+                (df['datetime'] < event_time) &
+                (df['latitude'].between(lat - lat_range, lat + lat_range)) &
+                (df['longitude'].between(lon - lon_range, lon + lon_range))
+            )
+            local_df_30d = df[local_mask_30d]
+            
+            local_mask_7d = (
+                (df['datetime'] >= start_7d) &
+                (df['datetime'] < event_time) &
+                (df['latitude'].between(lat - lat_range, lat + lat_range)) &
+                (df['longitude'].between(lon - lon_range, lon + lon_range))
+            )
+            local_df_7d = df[local_mask_7d]
+            
+            local_count_7d = len(local_df_7d)
+            local_count_30d = len(local_df_30d)
+            
+            if local_count_30d > 0:
+                local_max_mag = local_df_30d['magnitude'].max()
+                local_energy = np.log10(np.sum(10 ** (1.5 * local_df_30d['magnitude'].values)) + 1)
+                mag_deficit = mag - local_max_mag
+            
+            # Trend: recent vs older activity
+            if local_count_30d > local_count_7d and (local_count_30d - local_count_7d) > 0:
+                recent_trend = local_count_7d / (local_count_30d - local_count_7d + 1)
+            else:
+                recent_trend = 1.0
+        
+        # Depth categories
         is_shallow = float(depth < 70)
         is_intermediate = float(70 <= depth < 300)
         is_deep = float(depth >= 300)
         
+        # Build feature vector (16 features)
         features = np.array([
-            row['magnitude'] / 10.0,
-            (row['latitude'] + 90) / 180.0,
-            (row['longitude'] + 180) / 360.0,
+            # Basic event features
+            mag / 10.0,
+            (lat + 90) / 180.0,
+            (lon + 180) / 360.0,
             depth / 700.0,
-            row['dayofyear'] / 365.0,
+            # Temporal features
             np.sin(2 * np.pi * row['dayofyear'] / 365.0),
             np.cos(2 * np.pi * row['dayofyear'] / 365.0),
             row.get('hour', 12) / 24.0,
+            # Depth categories
             is_shallow,
             is_intermediate,
             is_deep,
-            row['magnitude'] ** 2 / 100.0,  # Quadratic magnitude term
+            # LOCAL CONTEXT (NEW - key for performance)
+            np.log1p(local_count_7d) / 5.0,
+            np.log1p(local_count_30d) / 6.0,
+            local_max_mag / 10.0,
+            local_energy / 15.0,
+            np.clip(mag_deficit + 2, 0, 4) / 4.0,  # Is this larger than recent events?
+            np.clip(recent_trend, 0, 5) / 5.0,  # Activity trend
         ], dtype=np.float32)
         
         return features
@@ -316,11 +360,7 @@ class EarthquakeDataProcessor:
         event_row: pd.Series,
         lookback_days: int = 30
     ) -> Dict[str, np.ndarray]:
-        """
-        Compute features for physics loss computation.
-        
-        Returns magnitude distribution and temporal decay patterns.
-        """
+        """Compute features for physics loss computation."""
         event_time = event_row['datetime']
         event_lat = event_row['latitude']
         event_lon = event_row['longitude']
@@ -338,12 +378,10 @@ class EarthquakeDataProcessor:
         )
         local_df = df[local_mask]
         
-        # Magnitude distribution (for G-R law)
         mag_bins = np.arange(0, 10, 0.5)
         mag_counts, _ = np.histogram(local_df['magnitude'].values, bins=mag_bins)
-        mag_counts = mag_counts.astype(np.float32) + 1e-6  # Avoid log(0)
+        mag_counts = mag_counts.astype(np.float32) + 1e-6
         
-        # Temporal decay (for Omori's law) - days since each event
         if len(local_df) > 0:
             time_diffs = (event_time - local_df['datetime']).dt.total_seconds() / 86400.0
             time_bins = np.array([0, 1, 2, 3, 5, 7, 14, 21, 30], dtype=np.float32)
@@ -358,11 +396,7 @@ class EarthquakeDataProcessor:
             'time_bins': np.array([0.5, 1.5, 2.5, 4, 6, 10.5, 17.5, 25.5], dtype=np.float32),
         }
     
-    def compute_labels(
-        self, 
-        df: pd.DataFrame, 
-        event_row: pd.Series
-    ) -> Dict[str, float]:
+    def compute_labels(self, df: pd.DataFrame, event_row: pd.Series) -> Dict[str, float]:
         """Compute multi-task labels for a mainshock event."""
         event_time = event_row['datetime']
         event_lat = event_row['latitude']
@@ -390,15 +424,13 @@ class EarthquakeDataProcessor:
         aftershock_count = len(aftershocks)
         max_aftershock_mag = aftershocks['magnitude'].max() if aftershock_count > 0 else 0.0
         
-        labels = {
+        return {
             'aftershock_count': min(aftershock_count, 100) / 100.0,
             'max_aftershock_mag': max_aftershock_mag / 10.0,
             'has_aftershocks': float(aftershock_count > 0),
             'tsunami': float(event_row.get('tsunami', 0)),
             'is_foreshock': float(is_foreshock),
         }
-        
-        return labels
     
     def create_dataset(
         self, 
@@ -409,6 +441,8 @@ class EarthquakeDataProcessor:
         """Create complete dataset from earthquake catalog."""
         if min_magnitude is None:
             min_magnitude = self.config.min_magnitude_trigger
+        
+        self._df_cache = df
         
         significant = df[df['magnitude'] >= min_magnitude].copy()
         
@@ -433,7 +467,7 @@ class EarthquakeDataProcessor:
             try:
                 context_date = row['datetime'] - pd.Timedelta(hours=1)
                 grid = self.create_multiscale_grids(df, context_date)
-                feat = self.extract_event_features(row)
+                feat = self.extract_event_features(row, df)  # Pass df for local context
                 label = self.compute_labels(df, row)
                 physics = self.compute_physics_features(df, row)
                 
@@ -499,7 +533,7 @@ class EarthquakeDataset(Dataset):
 # =============================================================================
 
 class EfficientChannelAttention(nn.Module):
-    """Lightweight channel attention (squeeze-and-excitation style)"""
+    """Lightweight channel attention"""
     
     def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
@@ -537,13 +571,7 @@ class SpatialAttention(nn.Module):
 class ConvBlock(nn.Module):
     """Convolutional block with attention"""
     
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        use_attention: bool = True,
-        dropout: float = 0.1
-    ):
+    def __init__(self, in_channels: int, out_channels: int, use_attention: bool = True, dropout: float = 0.1):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1),
@@ -557,7 +585,6 @@ class ConvBlock(nn.Module):
         
         self.channel_attn = EfficientChannelAttention(out_channels) if use_attention else nn.Identity()
         self.spatial_attn = SpatialAttention() if use_attention else nn.Identity()
-        
         self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -569,22 +596,22 @@ class ConvBlock(nn.Module):
 
 
 class SpatiotemporalEncoder(nn.Module):
-    """Multi-scale CNN encoder with attention for earthquake activity grids."""
+    """Multi-scale CNN encoder for earthquake activity grids."""
     
     def __init__(self, config: ModelConfig):
         super().__init__()
         
         n_scales = len(config.temporal_scales)
-        in_channels = 6 * n_scales  # 6 channels per scale
+        in_channels = 6 * n_scales
         
         self.conv1 = ConvBlock(in_channels, 48, use_attention=True, dropout=0.1)
-        self.pool1 = nn.MaxPool2d(2)  # 45 x 90
+        self.pool1 = nn.MaxPool2d(2)
         
         self.conv2 = ConvBlock(48, 96, use_attention=True, dropout=0.1)
-        self.pool2 = nn.MaxPool2d(2)  # 22 x 45
+        self.pool2 = nn.MaxPool2d(2)
         
         self.conv3 = ConvBlock(96, 144, use_attention=True, dropout=0.15)
-        self.pool3 = nn.MaxPool2d(2)  # 11 x 22
+        self.pool3 = nn.MaxPool2d(2)
         
         self.conv4 = ConvBlock(144, 192, use_attention=False, dropout=0.15)
         
@@ -608,9 +635,9 @@ class SpatiotemporalEncoder(nn.Module):
 
 
 class EventEncoder(nn.Module):
-    """MLP encoder for individual earthquake features"""
+    """MLP encoder for earthquake features with local context"""
     
-    def __init__(self, input_dim: int = 12, hidden_dim: int = 64, output_dim: int = 64, dropout: float = 0.3):
+    def __init__(self, input_dim: int = 16, hidden_dim: int = 64, output_dim: int = 64, dropout: float = 0.25):
         super().__init__()
         
         self.net = nn.Sequential(
@@ -632,11 +659,8 @@ class EventEncoder(nn.Module):
 
 class EnergyFunction(nn.Module):
     """
-    Energy-based scoring network.
-    
-    The energy function serves two purposes:
-    1. Anomaly detection: High energy = unusual pattern
-    2. Uncertainty quantification: Energy gradient indicates prediction confidence
+    Simplified Energy-based scoring network.
+    Key change: concatenate energy instead of gating.
     """
     
     def __init__(self, input_dim: int, hidden_dim: int = 128, dropout: float = 0.2):
@@ -644,135 +668,74 @@ class EnergyFunction(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),  # Simpler activation
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
-        )
-        
-        # Energy-based feature modulation
-        self.energy_gate = nn.Sequential(
-            nn.Linear(1, input_dim),
-            nn.Sigmoid()
         )
     
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z).squeeze(-1)
     
     def modulate(self, z: torch.Tensor) -> torch.Tensor:
-        """Modulate features based on energy (uncertainty-aware)"""
-        energy = self.net(z)
-        gate = self.energy_gate(energy)
-        return z * gate
+        """Concatenate energy as additional feature instead of gating"""
+        energy = self.net(z)  # (batch, 1)
+        energy_norm = torch.tanh(energy)  # Normalize to [-1, 1]
+        return torch.cat([z, energy_norm], dim=-1)
 
 
 class PhysicsConstraints(nn.Module):
-    """
-    Physics-informed regularization module.
-    
-    Enforces known seismological laws with learnable parameters.
-    """
+    """Physics-informed regularization module."""
     
     def __init__(self):
         super().__init__()
         
-        # Learnable physics parameters
-        self.log_b_value = nn.Parameter(torch.tensor(0.0))  # b ≈ 1.0
-        self.log_p_value = nn.Parameter(torch.tensor(0.0))  # p ≈ 1.0
-        self.log_c_value = nn.Parameter(torch.tensor(-4.6))  # c ≈ 0.01
-        
-        # Learnable productivity parameter for Bath's law
-        self.delta_m = nn.Parameter(torch.tensor(1.2))  # Typical ΔM ≈ 1.2
+        self.log_b_value = nn.Parameter(torch.tensor(0.0))
+        self.log_p_value = nn.Parameter(torch.tensor(0.0))
+        self.log_c_value = nn.Parameter(torch.tensor(-4.6))
+        self.delta_m = nn.Parameter(torch.tensor(1.2))
     
     @property
     def b_value(self) -> torch.Tensor:
-        return 0.7 + 0.6 * torch.sigmoid(self.log_b_value)  # Constrain to [0.7, 1.3]
+        return 0.7 + 0.6 * torch.sigmoid(self.log_b_value)
     
     @property
     def p_value(self) -> torch.Tensor:
-        return 0.8 + 0.4 * torch.sigmoid(self.log_p_value)  # Constrain to [0.8, 1.2]
+        return 0.8 + 0.4 * torch.sigmoid(self.log_p_value)
     
     @property
     def c_value(self) -> torch.Tensor:
-        return F.softplus(self.log_c_value) + 0.001  # Positive, typically small
+        return F.softplus(self.log_c_value) + 0.001
     
     def gutenberg_richter_loss(self, magnitude_counts: torch.Tensor) -> torch.Tensor:
-        """
-        Enforce Gutenberg-Richter law: log10(N) = a - b*M
-        
-        Args:
-            magnitude_counts: Shape (batch, n_mag_bins) - counts per magnitude bin
-        """
-        # magnitude_counts shape: (batch, 19) for bins [0, 0.5, 1, ..., 9.5]
         batch_size, n_bins = magnitude_counts.shape
-        
         log_counts = torch.log10(magnitude_counts + 1)
-        
         mags = torch.arange(n_bins, device=magnitude_counts.device, dtype=torch.float32) * 0.5
         mags = mags.unsqueeze(0).expand(batch_size, -1)
-        
-        # Fit a-value per sample (intercept)
-        a_value = log_counts[:, 0:1]  # Use first bin as reference
-        
-        # Expected log counts from G-R law
+        a_value = log_counts[:, 0:1]
         expected = a_value - self.b_value * mags
-        
-        # Only use bins with sufficient counts
         weight = (magnitude_counts > 0.5).float()
-        
         loss = (weight * (log_counts - expected) ** 2).sum(dim=1) / (weight.sum(dim=1) + 1e-8)
-        
         return loss.mean()
     
     def omori_loss(self, time_bins: torch.Tensor, time_counts: torch.Tensor) -> torch.Tensor:
-        """
-        Enforce Omori's Law: n(t) = K / (t + c)^p
-        
-        Args:
-            time_bins: Shape (batch, n_time_bins) - center of time bins
-            time_counts: Shape (batch, n_time_bins) - counts per time bin
-        """
-        # Predicted decay rate
         predicted = 1.0 / (time_bins + self.c_value) ** self.p_value
-        
-        # Normalize
         predicted = predicted / (predicted.sum(dim=1, keepdim=True) + 1e-8)
         actual = time_counts / (time_counts.sum(dim=1, keepdim=True) + 1e-8)
-        
-        # KL divergence style loss
-        loss = F.kl_div(
-            torch.log(predicted + 1e-8),
-            actual,
-            reduction='batchmean'
-        )
-        
+        loss = F.kl_div(torch.log(predicted + 1e-8), actual, reduction='batchmean')
         return loss
     
     def bath_law_loss(self, mainshock_mag: torch.Tensor, max_aftershock_mag: torch.Tensor) -> torch.Tensor:
-        """
-        Enforce Bath's Law: M_mainshock - M_max_aftershock ≈ 1.2
-        """
         expected_diff = self.delta_m
         actual_diff = mainshock_mag - max_aftershock_mag
-        
-        # Only apply where there are aftershocks
         valid_mask = max_aftershock_mag > 0
-        
         if valid_mask.sum() == 0:
             return torch.tensor(0.0, device=mainshock_mag.device)
-        
         loss = F.mse_loss(actual_diff[valid_mask], expected_diff.expand_as(actual_diff[valid_mask]))
-        
         return loss
     
     def get_params(self) -> Dict[str, float]:
-        """Return current physics parameter values"""
         return {
             'b_value': self.b_value.item(),
             'p_value': self.p_value.item(),
@@ -782,25 +745,26 @@ class PhysicsConstraints(nn.Module):
 
 
 class PredictionHeads(nn.Module):
-    """Multi-task prediction heads with energy-aware gating"""
+    """Multi-task prediction heads"""
     
-    def __init__(self, input_dim: int, hidden_dim: int = 96, dropout: float = 0.3):
+    def __init__(self, input_dim: int, hidden_dim: int = 96, dropout: float = 0.25):
         super().__init__()
         
-        # Shared representation
+        # +1 for energy feature from concatenation
+        actual_input = input_dim + 1
+        
         self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(actual_input, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
         
-        # Task-specific heads
         self.aftershock_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 3),  # count, max_mag, has_aftershocks
+            nn.Linear(hidden_dim // 2, 3),
         )
         
         self.tsunami_head = nn.Sequential(
@@ -840,28 +804,21 @@ class PredictionHeads(nn.Module):
 class PIEBM(nn.Module):
     """
     Physics-Informed Energy-Based Model for Earthquake Prediction
-    
-    Key innovations:
-    1. Energy function integrated with predictions via gating
-    2. Physics losses actually computed and backpropagated
-    3. Multi-scale temporal context
-    4. Attention-enhanced spatial encoding
+    Version 2.0 - Optimized
     """
     
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
-        # Encoders
         self.spatial_encoder = SpatiotemporalEncoder(config)
         self.event_encoder = EventEncoder(
-            input_dim=12,
+            input_dim=config.event_feature_dim,  # Now 16
             hidden_dim=64,
             output_dim=64,
             dropout=config.dropout
         )
         
-        # Fusion
         fusion_input_dim = config.hidden_dim + 64
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, config.latent_dim * 2),
@@ -872,45 +829,34 @@ class PIEBM(nn.Module):
             nn.LayerNorm(config.latent_dim),
         )
         
-        # Energy function
         self.energy_fn = EnergyFunction(
             config.latent_dim,
             config.ebm_hidden_dim,
             dropout=config.dropout
         )
         
-        # Prediction heads
         self.prediction_heads = PredictionHeads(
-            config.latent_dim,
+            config.latent_dim,  # Will be +1 inside for energy
             hidden_dim=config.hidden_dim // 2,
             dropout=config.dropout
         )
         
-        # Physics constraints
         self.physics = PhysicsConstraints()
     
-    def encode(
-        self, 
-        grid: torch.Tensor, 
-        event_features: torch.Tensor
-    ) -> torch.Tensor:
+    def encode(self, grid: torch.Tensor, event_features: torch.Tensor) -> torch.Tensor:
         spatial_features = self.spatial_encoder(grid)
         event_emb = self.event_encoder(event_features)
         combined = torch.cat([spatial_features, event_emb], dim=1)
         z = self.fusion(combined)
         return z
     
-    def forward(
-        self, 
-        grid: torch.Tensor,
-        event_features: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, grid: torch.Tensor, event_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         z = self.encode(grid, event_features)
         
-        # Energy-modulated features
-        z_modulated = self.energy_fn.modulate(z)
+        # Concatenate energy as feature
+        z_with_energy = self.energy_fn.modulate(z)
         
-        predictions = self.prediction_heads(z_modulated)
+        predictions = self.prediction_heads(z_with_energy)
         predictions['latent'] = z
         predictions['energy'] = self.energy_fn(z)
         
@@ -924,8 +870,6 @@ class PIEBM(nn.Module):
         mainshock_mag: torch.Tensor,
         max_aftershock_mag: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        """Compute all physics-informed losses"""
-        
         gr_loss = self.physics.gutenberg_richter_loss(magnitude_counts)
         omori_loss = self.physics.omori_loss(time_bins, time_counts)
         bath_loss = self.physics.bath_law_loss(mainshock_mag, max_aftershock_mag)
@@ -938,11 +882,7 @@ class PIEBM(nn.Module):
         }
     
     @torch.no_grad()
-    def compute_anomaly_score(
-        self, 
-        grid: torch.Tensor,
-        event_features: torch.Tensor
-    ) -> torch.Tensor:
+    def compute_anomaly_score(self, grid: torch.Tensor, event_features: torch.Tensor) -> torch.Tensor:
         z = self.encode(grid, event_features)
         return self.energy_fn(z)
 
@@ -952,7 +892,7 @@ class PIEBM(nn.Module):
 # =============================================================================
 
 class Trainer:
-    """Training loop with physics losses and class balancing"""
+    """Two-stage training with physics losses and class balancing"""
     
     def __init__(self, model: PIEBM, config: ModelConfig):
         self.model = model.to(config.device)
@@ -965,24 +905,19 @@ class Trainer:
             weight_decay=config.weight_decay
         )
         
-        # Warmup + cosine annealing
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=config.learning_rate,
-            epochs=config.epochs,
-            steps_per_epoch=1,  # Updated per epoch
-            pct_start=config.warmup_epochs / config.epochs,
-            anneal_strategy='cos'
-        )
-        
-        # Loss functions
         self.focal_loss = FocalLoss(gamma=config.focal_gamma, pos_weight=config.tsunami_pos_weight)
+        self.smooth_bce = LabelSmoothingBCE(smoothing=config.label_smoothing)
         
         self.history = {
             'train_loss': [],
             'val_loss': [],
             'metrics': [],
         }
+        
+        # Stage tracking
+        self.current_stage = 1
+        self.stage1_lambda_physics = 0.0
+        self.stage2_lambda_physics = config.lambda_physics
     
     def compute_loss(
         self,
@@ -991,72 +926,68 @@ class Trainer:
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """Compute all loss components"""
-        
         losses = {}
         
         # Regression losses
-        losses['aftershock_count'] = F.mse_loss(
-            predictions['aftershock_count'], labels[:, 0]
-        )
-        losses['max_aftershock_mag'] = F.huber_loss(
-            predictions['max_aftershock_mag'], labels[:, 1], delta=0.1
-        )
+        losses['aftershock_count'] = F.mse_loss(predictions['aftershock_count'], labels[:, 0])
+        losses['max_aftershock_mag'] = F.huber_loss(predictions['max_aftershock_mag'], labels[:, 1], delta=0.1)
         
-        # Classification losses
-        losses['has_aftershocks'] = F.binary_cross_entropy(
-            predictions['has_aftershocks'], labels[:, 2]
-        )
+        # Classification losses with label smoothing
+        losses['has_aftershocks'] = self.smooth_bce(predictions['has_aftershocks'], labels[:, 2])
         
-        # Focal loss for tsunami (highly imbalanced)
+        # Focal loss for tsunami
         losses['tsunami'] = self.focal_loss(predictions['tsunami'], labels[:, 3])
         
-        # Weighted BCE for foreshock
-        pos_weight = 2.0  # Upweight positive class
-        losses['is_foreshock'] = F.binary_cross_entropy(
-            predictions['is_foreshock'],
+        # Foreshock with class weighting
+        pos_weight = 3.0
+        weight = torch.where(labels[:, 4] > 0.5, pos_weight, 1.0)
+        losses['is_foreshock'] = (F.binary_cross_entropy(
+            predictions['is_foreshock'].clamp(1e-7, 1-1e-7),
             labels[:, 4],
-            weight=torch.where(labels[:, 4] > 0.5, pos_weight, 1.0)
-        )
+            reduction='none'
+        ) * weight).mean()
         
         # Contrastive energy loss
         z = predictions['latent']
         e_real = predictions['energy']
-        
-        z_neg = z + torch.randn_like(z) * 0.5
+        z_neg = z + torch.randn_like(z) * 0.3
         e_neg = self.model.energy_fn(z_neg)
-        
         losses['contrastive'] = F.softplus(e_real - e_neg + self.config.contrastive_margin).mean()
         
-        # Energy regularization (prevent collapse)
+        # Energy regularization
         losses['energy_reg'] = self.config.energy_reg_weight * (e_real ** 2).mean()
         
-        # Physics losses
-        mainshock_mag = batch['event_features'][:, 0] * 10  # Denormalize
-        max_aftershock_mag = labels[:, 1] * 10
+        # Physics losses - only in stage 2
+        current_lambda = self.stage1_lambda_physics if self.current_stage == 1 else self.stage2_lambda_physics
         
-        physics_losses = self.model.compute_physics_loss(
-            batch['magnitude_counts'],
-            batch['time_bins'],
-            batch['time_counts'],
-            mainshock_mag,
-            max_aftershock_mag
-        )
-        losses.update(physics_losses)
+        if current_lambda > 0:
+            mainshock_mag = batch['event_features'][:, 0] * 10
+            max_aftershock_mag = labels[:, 1] * 10
+            
+            physics_losses = self.model.compute_physics_loss(
+                batch['magnitude_counts'],
+                batch['time_bins'],
+                batch['time_counts'],
+                mainshock_mag,
+                max_aftershock_mag
+            )
+            losses.update(physics_losses)
+        else:
+            losses['physics_total'] = torch.tensor(0.0, device=self.device)
         
         # Total loss
         total = (
             losses['aftershock_count'] * 1.0 +
             losses['max_aftershock_mag'] * 1.0 +
-            losses['has_aftershocks'] * 1.0 +
-            losses['tsunami'] * 1.0 +  # Focal loss handles weighting
+            losses['has_aftershocks'] * 1.5 +  # Slightly higher weight
+            losses['tsunami'] * 1.0 +
             losses['is_foreshock'] * 1.0 +
             losses['contrastive'] * self.config.lambda_contrastive +
             losses['energy_reg'] +
-            losses['physics_total'] * self.config.lambda_physics
+            losses['physics_total'] * current_lambda
         )
         
         losses['total'] = total
-        
         return losses
     
     def train_epoch(self, dataloader: DataLoader) -> float:
@@ -1068,7 +999,6 @@ class Trainer:
             event_features = batch['event_features'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            # Move physics features to device
             batch_device = {
                 'event_features': event_features,
                 'magnitude_counts': batch['magnitude_counts'].to(self.device),
@@ -1118,7 +1048,7 @@ class Trainer:
             all_preds['has_aftershocks_prob'].extend(predictions['has_aftershocks'].cpu().numpy())
             all_preds['has_aftershocks'].extend((predictions['has_aftershocks'] > 0.5).float().cpu().numpy())
             all_preds['tsunami_prob'].extend(predictions['tsunami'].cpu().numpy())
-            all_preds['tsunami'].extend((predictions['tsunami'] > 0.3).float().cpu().numpy())  # Lower threshold
+            all_preds['tsunami'].extend((predictions['tsunami'] > 0.3).float().cpu().numpy())
             all_preds['is_foreshock_prob'].extend(predictions['is_foreshock'].cpu().numpy())
             all_preds['is_foreshock'].extend((predictions['is_foreshock'] > 0.5).float().cpu().numpy())
             all_preds['energy'].extend(predictions['energy'].cpu().numpy())
@@ -1144,7 +1074,6 @@ class Trainer:
             tp = np.sum((preds == 1) & (labels_arr == 1))
             fp = np.sum((preds == 1) & (labels_arr == 0))
             fn = np.sum((preds == 0) & (labels_arr == 1))
-            tn = np.sum((preds == 0) & (labels_arr == 0))
             
             precision = tp / (tp + fp + 1e-8)
             recall = tp / (tp + fn + 1e-8)
@@ -1154,7 +1083,6 @@ class Trainer:
             metrics[f'{task}_recall'] = recall
             metrics[f'{task}_f1'] = f1
             
-            # AUC
             if len(np.unique(labels_arr)) > 1:
                 from sklearn.metrics import roc_auc_score
                 try:
@@ -1180,40 +1108,42 @@ class Trainer:
         epochs: int = None,
         patience: int = None
     ):
+        """Two-stage training: predictions first, then physics"""
+        
         if epochs is None:
             epochs = self.config.epochs
         if patience is None:
             patience = self.config.patience
         
-        # Reinitialize scheduler with correct steps
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        # Stage 1: Train predictions only (no physics)
+        stage1_epochs = epochs // 3
+        print(f"\n{'='*60}")
+        print(f"STAGE 1: Prediction Training ({stage1_epochs} epochs, no physics)")
+        print(f"{'='*60}")
+        
+        self.current_stage = 1
+        best_f1 = 0.0
+        best_model_state = None
+        no_improve = 0
+        
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=self.config.learning_rate,
-            epochs=epochs,
+            epochs=stage1_epochs,
             steps_per_epoch=len(train_loader),
-            pct_start=self.config.warmup_epochs / epochs,
+            pct_start=0.1,
             anneal_strategy='cos'
         )
         
-        best_val_loss = float('inf')
-        best_f1 = 0.0
-        epochs_without_improvement = 0
-        best_model_state = None
-        
-        print("\n" + "=" * 60)
-        print("TRAINING PI-EBM")
-        print("=" * 60)
-        
-        for epoch in range(epochs):
+        for epoch in range(stage1_epochs):
             train_loss = self.train_epoch(train_loader)
             self.history['train_loss'].append(train_loss)
             
-            if val_loader is not None:
+            if val_loader:
                 metrics = self.evaluate(val_loader)
                 self.history['val_loss'].append(metrics['val_loss'])
                 self.history['metrics'].append(metrics)
                 
-                # Use combined metric for model selection
                 combined_f1 = (
                     metrics['has_aftershocks_f1'] * 0.5 +
                     metrics['tsunami_f1'] * 0.3 +
@@ -1222,37 +1152,86 @@ class Trainer:
                 
                 if combined_f1 > best_f1:
                     best_f1 = combined_f1
-                    best_val_loss = metrics['val_loss']
-                    epochs_without_improvement = 0
+                    no_improve = 0
                     best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
                     torch.save(self.model.state_dict(), 'best_model.pt')
                 else:
-                    epochs_without_improvement += 1
+                    no_improve += 1
                 
-                if epoch % 5 == 0 or epoch == epochs - 1:
-                    lr = self.optimizer.param_groups[0]['lr']
+                if epoch % 5 == 0 or epoch == stage1_epochs - 1:
+                    print(f"Epoch {epoch:3d}/{stage1_epochs} | "
+                          f"Loss: {train_loss:.4f} | "
+                          f"AS-F1: {metrics['has_aftershocks_f1']:.3f} | "
+                          f"TS-F1: {metrics['tsunami_f1']:.3f} | "
+                          f"FS-F1: {metrics['is_foreshock_f1']:.3f} | "
+                          f"Avg: {combined_f1:.3f}")
+        
+        print(f"\nStage 1 complete. Best F1: {best_f1:.4f}")
+        
+        # Stage 2: Fine-tune with physics
+        stage2_epochs = epochs - stage1_epochs
+        print(f"\n{'='*60}")
+        print(f"STAGE 2: Physics Fine-tuning ({stage2_epochs} epochs)")
+        print(f"{'='*60}")
+        
+        self.current_stage = 2
+        
+        # Lower learning rate for stage 2
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.config.learning_rate * 0.3
+        
+        scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=stage2_epochs,
+            eta_min=1e-6
+        )
+        
+        no_improve = 0
+        
+        for epoch in range(stage2_epochs):
+            train_loss = self.train_epoch(train_loader)
+            self.history['train_loss'].append(train_loss)
+            scheduler2.step()
+            
+            if val_loader:
+                metrics = self.evaluate(val_loader)
+                self.history['val_loss'].append(metrics['val_loss'])
+                self.history['metrics'].append(metrics)
+                
+                combined_f1 = (
+                    metrics['has_aftershocks_f1'] * 0.5 +
+                    metrics['tsunami_f1'] * 0.3 +
+                    metrics['is_foreshock_f1'] * 0.2
+                )
+                
+                if combined_f1 > best_f1:
+                    best_f1 = combined_f1
+                    no_improve = 0
+                    best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                    torch.save(self.model.state_dict(), 'best_model.pt')
+                else:
+                    no_improve += 1
+                
+                if epoch % 5 == 0 or epoch == stage2_epochs - 1:
                     physics = self.model.physics.get_params()
-                    print(f"Epoch {epoch:3d}/{epochs} | "
-                          f"Train: {train_loss:.4f} | "
-                          f"Val: {metrics['val_loss']:.4f} | "
+                    print(f"Epoch {epoch:3d}/{stage2_epochs} | "
+                          f"Loss: {train_loss:.4f} | "
                           f"AS-F1: {metrics['has_aftershocks_f1']:.3f} | "
                           f"TS-F1: {metrics['tsunami_f1']:.3f} | "
                           f"FS-F1: {metrics['is_foreshock_f1']:.3f} | "
                           f"b={physics['b_value']:.2f}")
                 
-                if epochs_without_improvement >= patience:
+                if no_improve >= patience:
                     print(f"\n⚠️  Early stopping at epoch {epoch}")
                     break
-            else:
-                self.scheduler.step()
         
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
             print(f"\n✓ Restored best model (combined F1: {best_f1:.4f})")
         
-        print("\n" + "=" * 60)
+        print(f"\n{'='*60}")
         print(f"Training complete. Best combined F1: {best_f1:.4f}")
-        print("=" * 60)
+        print(f"{'='*60}")
         
         return self.history
 
@@ -1265,16 +1244,14 @@ def main():
     """Main training pipeline"""
     
     print("=" * 70)
-    print("PI-EBM: Physics-Informed Energy-Based Model for Earthquake Prediction")
+    print("PI-EBM v2.0: Optimized for F1 > 0.55")
     print("=" * 70)
     
     config = ModelConfig()
     print(f"\nDevice: {config.device}")
     print(f"Batch size: {config.batch_size}")
     print(f"Epochs: {config.epochs} (patience={config.patience})")
-    print(f"Learning rate: {config.learning_rate}")
-    print(f"Physics loss weight: {config.lambda_physics}")
-    print(f"Temporal scales: {config.temporal_scales}")
+    print(f"Event features: {config.event_feature_dim} (including local context)")
     
     print("\n[1/4] Loading earthquake data...")
     processor = EarthquakeDataProcessor(config)
@@ -1289,8 +1266,11 @@ def main():
     
     dataset = EarthquakeDataset(grids, event_features, labels, physics_features)
     
-    # Compute class weights for sampling
+    # Compute class weights
     tsunami_labels = [labels[i]['tsunami'] for i in range(len(labels))]
+    aftershock_labels = [labels[i]['has_aftershocks'] for i in range(len(labels))]
+    foreshock_labels = [labels[i]['is_foreshock'] for i in range(len(labels))]
+    
     tsunami_ratio = sum(tsunami_labels) / len(tsunami_labels)
     if tsunami_ratio > 0:
         config.tsunami_pos_weight = min((1 - tsunami_ratio) / tsunami_ratio, 100.0)
@@ -1305,10 +1285,29 @@ def main():
         dataset, [train_size, val_size], generator=generator
     )
     
+    # Weighted sampling for training
+    train_indices = train_dataset.indices
+    sample_weights = []
+    for idx in train_indices:
+        w = 1.0
+        if labels[idx]['tsunami'] == 1:
+            w += 10.0  # Heavily weight tsunami
+        if labels[idx]['is_foreshock'] == 1:
+            w += 3.0  # Weight foreshocks
+        if labels[idx]['has_aftershocks'] == 0:
+            w += 0.5  # Slightly weight non-aftershock
+        sample_weights.append(w)
+    
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(train_indices),
+        replacement=True
+    )
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=config.batch_size, 
-        shuffle=True,
+        sampler=sampler,
         num_workers=0,
         drop_last=True
     )
@@ -1321,21 +1320,16 @@ def main():
     print(f"   Training samples: {len(train_dataset):,}")
     print(f"   Validation samples: {len(val_dataset):,}")
     
-    aftershock_labels = [labels[i]['has_aftershocks'] for i in range(len(labels))]
-    foreshock_labels = [labels[i]['is_foreshock'] for i in range(len(labels))]
-    
     print(f"\n   Class distribution:")
     print(f"   - Has aftershocks: {sum(aftershock_labels)/len(aftershock_labels)*100:.1f}%")
-    print(f"   - Tsunami: {sum(tsunami_labels)/len(tsunami_labels)*100:.1f}%")
+    print(f"   - Tsunami: {sum(tsunami_labels)/len(tsunami_labels)*100:.2f}%")
     print(f"   - Is foreshock: {sum(foreshock_labels)/len(foreshock_labels)*100:.1f}%")
     
     print("\n[3/4] Initializing PI-EBM model...")
     model = PIEBM(config)
     
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Total parameters: {total_params:,}")
-    print(f"   Trainable parameters: {trainable_params:,}")
     
     print("\n[4/4] Training model...")
     trainer = Trainer(model, config)
@@ -1346,6 +1340,13 @@ def main():
     print("=" * 70)
     
     final_metrics = trainer.evaluate(val_loader)
+    
+    # Calculate average F1
+    avg_f1 = (
+        final_metrics['has_aftershocks_f1'] * 0.5 +
+        final_metrics['tsunami_f1'] * 0.3 +
+        final_metrics['is_foreshock_f1'] * 0.2
+    )
     
     print("\nPrediction Performance:")
     print(f"   Aftershock Detection:  Acc={final_metrics['has_aftershocks_accuracy']:.3f}, "
@@ -1364,15 +1365,13 @@ def main():
           f"F1={final_metrics['is_foreshock_f1']:.3f}, "
           f"AUC={final_metrics['is_foreshock_auc']:.3f}")
     
+    print(f"\n   >>> AVERAGE F1: {avg_f1:.3f} <<<")
+    
     print("\nLearned Physics Parameters:")
     print(f"   Gutenberg-Richter b-value: {final_metrics['physics_b_value']:.3f} (expected ~1.0)")
     print(f"   Omori p-value: {final_metrics['physics_p_value']:.3f} (expected ~1.0)")
     print(f"   Omori c-value: {final_metrics['physics_c_value']:.4f}")
     print(f"   Bath's ΔM: {final_metrics['physics_delta_m']:.3f} (expected ~1.2)")
-    
-    print("\nEnergy Statistics:")
-    print(f"   Mean energy: {final_metrics['energy_mean']:.3f}")
-    print(f"   Std energy: {final_metrics['energy_std']:.3f}")
     
     torch.save({
         'model_state_dict': model.state_dict(),
