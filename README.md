@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Dataset](https://img.shields.io/badge/🤗%20Dataset-Poseidon-orange)](https://huggingface.co/datasets/BorisKriuk/Poseidon)
 
-A physics-informed Energy-Based Model (EBM) for multi-task seismic event prediction, trained on 2.8 million earthquakes spanning 35 years (1990-2024).
+A physics-informed Energy-Based Model (EBM) for multi-task seismic event prediction, trained on 2.8 million earthquakes spanning 35 years (1990-2020).
 
 ## 🌊 Overview
 
@@ -63,7 +63,7 @@ Input Features (26D)
 
 This model is trained on the **Poseidon Global Earthquake Dataset**:
 
-🤗 **[BorisKriuk/Poseidon](https://huggingface.co/datasets/BorisKriuk/Poseidon)**
+Hugging Face 🤗 **[BorisKriuk/Poseidon](https://huggingface.co/datasets/BorisKriuk/Poseidon)**
 
 | Metric | Value |
 |--------|-------|
@@ -167,7 +167,6 @@ log₁₀(E) = 1.5M + 4.8
 POSEIDON/
 ├── model.py              # PI-EBM architecture
 ├── data_fetcher.py       # USGS data pipeline
-├── visualizations.py     # Result visualization
 ├── requirements.txt      # Dependencies
 ├── LICENSE               # MIT License
 └── README.md
@@ -183,10 +182,10 @@ POSEIDON/
 ## 📜 Citation
 
 ```bibtex
-@software{poseidon2024,
+@software{poseidon2025,
   author = {Kriuk, Boris},
   title = {POSEIDON: Physics-Optimized Seismic Energy Inference and Detection Operating Network},
-  year = {2024},
+  year = {2025},
   url = {https://github.com/BorisKriuk/POSEIDON}
 }
 ```
